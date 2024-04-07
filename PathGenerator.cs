@@ -16,24 +16,27 @@ namespace AutoparkPathsGenerator
         private readonly string ApiKey = _apiKey;
 
         private Queue<Coordinate> Coordinates = new();
+        private TimeSpan Duration = new();
 
-        public async Task OffsetGenerate(int vehicleId, string cityName, double offset)
+        public async Task GenerateInRange(int vehicleId, string cityName, DateTime start, DateTime finish)
         {
-            var vehicle = db.Vehicles.Where(v => v.Id == vehicleId).FirstOrDefault();
-            if (vehicle == null)
+            //Check if vehicle in question exists
+            var vehicle = db.Vehicles.Where(v => v.Id == vehicleId).FirstOrDefault()
+                ?? throw new ArgumentException("Incorrect vehicle id");
+
+            if (finish <= start)
             {
-                return;
+                throw new ArgumentException("Incorrect time range");
             }
 
             string osmId = await GetOsmIdAsync(cityName);
             MultiPolygon polygon = await GetPolygon(osmId);
             List<Tri> triangles = GetTriangles(polygon);
+            DateTime currentTime = start;
 
-            while (true)
+            while (currentTime <= finish)
             {
-                var delayTask = Task.Delay(10000);
-
-                if (Coordinates.Count == 0)
+                if (Coordinates.Count == 0 && Duration == default)
                 {
                     bool succeed;
                     do
@@ -41,7 +44,14 @@ namespace AutoparkPathsGenerator
                         succeed = await BuildPath(polygon, triangles);
                     }
                     while (!succeed);
-
+                } else if (Duration != default)
+                {
+                    var ride = new Ride()
+                    {
+                        Start = currentTime,
+                        Finish = currentTime.Add(Duration),
+                        VehicleId = vehicleId
+                    };
                 }
 
                 //Register a point for given vehicle
@@ -49,16 +59,15 @@ namespace AutoparkPathsGenerator
                 {
                     Point = new Point(Coordinates.Dequeue()) { SRID = 4326 },
                     VehicleId = vehicleId,
-                    RegisterTime = DateTime.Now.AddDays(offset)
+                    RegisterTime = DateTime.Now
                 };
                 db.Points.Add(point);
                 Console.WriteLine(point.Point + " " + point.RegisterTime);
                 db.SaveChanges();
-                await delayTask;
             }
         }
 
-        public async Task Generate(int vehicleId, string cityName)
+        public async Task RealTimeGenerate(int vehicleId, string cityName)
         {
             //Check if vehicle in question exists
             var vehicle = db.Vehicles.Where(v => v.Id == vehicleId).FirstOrDefault();
@@ -184,7 +193,7 @@ namespace AutoparkPathsGenerator
             if (response.IsSuccessStatusCode) return response;
 
             Console.WriteLine(await response.Content.ReadAsStringAsync());
-            switch(response.StatusCode)
+            switch (response.StatusCode)
             {
                 case System.Net.HttpStatusCode.BadRequest:
                     throw new HttpRequestException("Couldn't build a road");
@@ -209,8 +218,18 @@ namespace AutoparkPathsGenerator
                     Point firstPoint = GeneratePoint(polygon, triangles);
                     Point secondPoint = GeneratePoint(polygon, triangles);
                     GeoJsonReader reader = new();
-                    featureCollection = reader.Read<FeatureCollection>(await (await GetPathBetweenAsync(firstPoint, secondPoint))
-                        .Content.ReadAsStringAsync());
+                    var rawResponse = (await GetPathBetweenAsync(firstPoint, secondPoint)).Content;
+                    featureCollection = reader.Read<FeatureCollection>(await rawResponse.ReadAsStringAsync());
+                    using JsonDocument jsonResponse = await JsonDocument.ParseAsync(await rawResponse.ReadAsStreamAsync());
+                    if (!double.TryParse(jsonResponse.RootElement.GetProperty("routes")[0].GetProperty("summary").GetProperty("duration").ToString(),
+                        out double minutes))
+                    {
+                        Console.WriteLine("Couldn't read time string as a number");
+                    }
+                    else
+                    {
+                        Duration = TimeSpan.FromMinutes(minutes);
+                    }
                 }
                 catch
                 {
