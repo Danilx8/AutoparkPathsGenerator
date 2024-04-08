@@ -10,30 +10,34 @@ using System.Text.Json;
 
 namespace AutoparkPathsGenerator
 {
-    public class PathGenerator(ApplicationDbContext _db, string _apiKey)
+    public class PathGenerator(ApplicationDbContext db, string apiKey)
     {
-        private readonly ApplicationDbContext db = _db;
-        private readonly string ApiKey = _apiKey;
+        private readonly ApplicationDbContext _db = db;
 
-        private Queue<Coordinate> Coordinates = new();
-
-        public async Task OffsetGenerate(int vehicleId, string cityName, double offset)
+        private Queue<Coordinate> _coordinates = new();
+        private DateTime _rideStart = new();
+        private float _ridePointsInterval;
+            
+        public async Task OffsetGenerate(int vehicleId, string cityName, int daysOffset, int requiredRidesAmount)
         {
-            var vehicle = db.Vehicles.Where(v => v.Id == vehicleId).FirstOrDefault();
+            var vehicle = _db.Vehicles.FirstOrDefault(v => v.Id == vehicleId);
             if (vehicle == null)
             {
+                Console.WriteLine("There's no vehicle with the given id");
                 return;
             }
 
             string osmId = await GetOsmIdAsync(cityName);
             MultiPolygon polygon = await GetPolygon(osmId);
             List<Tri> triangles = GetTriangles(polygon);
+            DateTime registerTime = DateTime.Now.AddDays(daysOffset);
+            _rideStart = registerTime;
 
-            while (true)
+            int generatedRidesAmount = 0;
+            while(generatedRidesAmount < requiredRidesAmount)
             {
-                var delayTask = Task.Delay(10000);
-
-                if (Coordinates.Count == 0)
+                // Build new path for each new ride
+                if (_coordinates.Count == 0)
                 {
                     bool succeed;
                     do
@@ -41,27 +45,43 @@ namespace AutoparkPathsGenerator
                         succeed = await BuildPath(polygon, triangles);
                     }
                     while (!succeed);
-
                 }
 
                 //Register a point for given vehicle
                 var point = new Geopoint()
                 {
-                    Point = new Point(Coordinates.Dequeue()) { SRID = 4326 },
+                    Point = new Point(_coordinates.Dequeue()) { SRID = 4326 },
                     VehicleId = vehicleId,
-                    RegisterTime = DateTime.Now.AddDays(offset)
+                    RegisterTime = registerTime
                 };
-                db.Points.Add(point);
-                Console.WriteLine(point.Point + " " + point.RegisterTime);
-                db.SaveChanges();
-                await delayTask;
+                _db.Points.Add(point);
+
+                registerTime = registerTime.AddSeconds(_ridePointsInterval);
+                
+                // Persist a ride when its path is already persisted
+                if (_coordinates.Count == 0 && _rideStart != registerTime)
+                {
+                    var ride = new Ride
+                    {
+                        Start = _rideStart,
+                        Finish = point.RegisterTime,
+                        VehicleId = vehicleId
+                    };
+                    db.Rides.Add(ride);
+                    await db.SaveChangesAsync();
+                    ++generatedRidesAmount;
+                    Console.WriteLine($"Ride number {generatedRidesAmount} generated and saved in interval: " +
+                                      $"{ride.Start} - {ride.Finish}");
+                    
+                    _rideStart = registerTime;
+                }
             }
         }
 
-        public async Task Generate(int vehicleId, string cityName)
+        public async Task Generate(int vehicleId, string cityName, int requiredRidesAmount)
         {
             //Check if vehicle in question exists
-            var vehicle = db.Vehicles.Where(v => v.Id == vehicleId).FirstOrDefault();
+            var vehicle = _db.Vehicles.FirstOrDefault(v => v.Id == vehicleId);
             if (vehicle == null)
             {
                 return;
@@ -70,12 +90,14 @@ namespace AutoparkPathsGenerator
             string osmId = await GetOsmIdAsync(cityName);
             MultiPolygon polygon = await GetPolygon(osmId);
             List<Tri> triangles = GetTriangles(polygon);
+            DateTime registerTime = DateTime.Now;
 
-            while (true)
+            var delayTask = Task.Delay(10000);
+            int generatedRidesAmount = 0;
+            while (generatedRidesAmount < requiredRidesAmount)
             {
-                var delayTask = Task.Delay(10000);
-
-                if (Coordinates.Count == 0)
+                //Build new path for each new ride
+                if (_coordinates.Count == 0)
                 {
                     bool succeed;
                     do
@@ -89,13 +111,29 @@ namespace AutoparkPathsGenerator
                 //Register a point for given vehicle
                 var point = new Geopoint()
                 {
-                    Point = new Point(Coordinates.Dequeue()) { SRID = 4326 },
+                    Point = new Point(_coordinates.Dequeue()) { SRID = 4326 },
                     VehicleId = vehicleId,
                     RegisterTime = DateTime.Now
                 };
-                db.Points.Add(point);
-                Console.WriteLine(point.Point + " " + point.RegisterTime);
-                db.SaveChanges();
+                _db.Points.Add(point);
+                
+                //Persist a ride when all its points are persisted
+                if (_coordinates.Count == 0 && _rideStart != registerTime)
+                {
+                    var ride = new Ride
+                    {
+                        Start = _rideStart,
+                        Finish = point.RegisterTime,
+                        VehicleId = vehicleId
+                    };
+                    db.Rides.Add(ride);
+                    await db.SaveChangesAsync();
+                    ++generatedRidesAmount;
+                    Console.WriteLine($"Ride number {generatedRidesAmount} generated and saved in interval: " +
+                                      $"{ride.Start} - {ride.Finish}");
+                    
+                    _rideStart = registerTime;
+                }
                 await delayTask;
             }
         }
@@ -157,8 +195,6 @@ namespace AutoparkPathsGenerator
         //Create a path from one path to another
         private async Task<HttpResponseMessage> GetPathBetweenAsync(Point start, Point finish)
         {
-            using HttpClient client = new();
-
             var json = JsonSerializer.Serialize(new
             {
                 coordinates = new float[][]
@@ -171,15 +207,15 @@ namespace AutoparkPathsGenerator
                     ]
                 }
             });
-
-            var headers = new Dictionary<string, string>
-            {
-                { "Accept", "application/json, application/geo+json, application/gpx+xml, img/png; charset=utf-8" },
-                { "Content-Type", "application/json" },
-                { "Authorization", ApiKey }
-            };
+            
+            using HttpClient client = new();
+            client.DefaultRequestHeaders.TryAddWithoutValidation("Accept",
+                "application/json, application/geo+json, application/gpx+xml, img/png; charset=utf-8");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type", "application/json");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", apiKey);
+            
             StringContent body = new(json, Encoding.UTF8, "application/json");
-            string query = "https://api.openrouteservice.org/v2/directions/driving-car/geojson?api_key=" + ApiKey;
+            string query = "https://api.openrouteservice.org/v2/directions/driving-car/geojson?api_key=" + apiKey;
             var response = await client.PostAsync(query, body);
             if (response.IsSuccessStatusCode) return response;
 
@@ -209,8 +245,9 @@ namespace AutoparkPathsGenerator
                     Point firstPoint = GeneratePoint(polygon, triangles);
                     Point secondPoint = GeneratePoint(polygon, triangles);
                     GeoJsonReader reader = new();
-                    featureCollection = reader.Read<FeatureCollection>(await (await GetPathBetweenAsync(firstPoint, secondPoint))
-                        .Content.ReadAsStringAsync());
+                    featureCollection = reader.Read<FeatureCollection>(await (
+                                await GetPathBetweenAsync(firstPoint, secondPoint)
+                            ).Content.ReadAsStringAsync());
                 }
                 catch
                 {
@@ -222,11 +259,21 @@ namespace AutoparkPathsGenerator
 
             LineString? path = featureCollection[0].Geometry as LineString;
             if (path == null) return false;
-
+            if (!float.TryParse((featureCollection[0].Attributes.GetOptionalValue("summary") as IAttributesTable 
+                                 ?? throw new Exception("No summary field was returned by the map server"))
+                    .GetOptionalValue("duration").ToString(), out var rideDuration))
+            {
+                Console.WriteLine("Failed parsing time");
+                return false;
+            }
+            
             foreach (var item in path.Coordinates)
             {
-                Coordinates.Enqueue(item);
-            };
+                _coordinates.Enqueue(item);
+            }
+
+            _ridePointsInterval = rideDuration / _coordinates.Count;
+
             return true;
         }
 
